@@ -1355,6 +1355,7 @@ name = "hop-app"
 version = "0.1.0"
 dependencies = [
  "hop-core",
+ "serde",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",

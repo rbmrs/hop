@@ -9,14 +9,16 @@ use hop_core::config::{self, Config};
 use hop_core::hotkeys::{self, Binding};
 use hop_core::menu::{MenuEntry, port_entries};
 use hop_core::{DdcBackend, Monitor, list_monitors};
+use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, RunEvent, Wry};
+use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Wry};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 const TRAY_ID: &str = "hop";
 const QUIT_ID: &str = "quit";
+const SETTINGS_ID: &str = "settings";
 const PORT_PREFIX: &str = "port:";
 /// Fallback refresh, for input changes made outside Hop.
 const REFRESH_EVERY: Duration = Duration::from_secs(15);
@@ -30,6 +32,74 @@ enum Job {
     Switch(u8),
     /// Hotkeys that could not be registered, to show in the menu.
     HotkeyProblems(Vec<String>),
+    GetSettings(Sender<Result<Settings, String>>),
+    SavePort {
+        code: u8,
+        label: String,
+        hidden: bool,
+        reply: Sender<Result<(), String>>,
+    },
+}
+
+impl Job {
+    /// Answers a waiting Settings window when the job cannot run.
+    fn fail(self, error: &str) {
+        match self {
+            Job::GetSettings(reply) => {
+                let _ = reply.send(Err(error.to_string()));
+            }
+            Job::SavePort { reply, .. } => {
+                let _ = reply.send(Err(error.to_string()));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Settings {
+    monitor: String,
+    ports: Vec<PortView>,
+}
+
+#[derive(Serialize)]
+struct PortView {
+    code: u8,
+    name: String,
+    label: Option<String>,
+    hidden: bool,
+}
+
+/// Sends a job to the DDC worker, which owns the monitor state, and waits
+/// for its reply.
+fn ask<T>(
+    jobs: &Sender<Job>,
+    job: impl FnOnce(Sender<Result<T, String>>) -> Job,
+) -> Result<T, String> {
+    let (reply, answer) = mpsc::channel();
+    jobs.send(job(reply)).map_err(|e| e.to_string())?;
+    answer.recv().map_err(|e| e.to_string())?
+}
+
+// `async` runs these off the main thread; the worker can take a second.
+#[tauri::command(async)]
+fn get_settings(jobs: State<'_, Sender<Job>>) -> Result<Settings, String> {
+    ask(&jobs, Job::GetSettings)
+}
+
+#[tauri::command(async)]
+fn save_port(
+    jobs: State<'_, Sender<Job>>,
+    code: u8,
+    label: String,
+    hidden: bool,
+) -> Result<(), String> {
+    ask(&jobs, |reply| Job::SavePort {
+        code,
+        label,
+        hidden,
+        reply,
+    })
 }
 
 /// What the menu shows.
@@ -44,6 +114,7 @@ enum MenuState {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![get_settings, save_port])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -70,6 +141,7 @@ fn main() {
                 })
                 .build(app)?;
 
+            app.manage(jobs.clone());
             let handle = app.handle().clone();
             let worker_jobs = jobs.clone();
             thread::spawn(move || ddc_worker(&handle, rx, worker_jobs));
@@ -100,6 +172,8 @@ fn main() {
 fn on_menu_click(app: &AppHandle, id: &str, jobs: &Sender<Job>) {
     if id == QUIT_ID {
         app.exit(0);
+    } else if id == SETTINGS_ID {
+        open_settings(app);
     } else if let Some(code) = id.strip_prefix(PORT_PREFIX).and_then(|c| c.parse().ok()) {
         let _ = jobs.send(Job::Switch(code));
     }
@@ -109,7 +183,7 @@ fn on_menu_click(app: &AppHandle, id: &str, jobs: &Sender<Job>) {
 /// 1 s), then only re-reads the active input.
 fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>, sender: Sender<Job>) {
     let backend = hop_core::default_backend();
-    let mut monitor: Option<Monitor> = None;
+    let mut loaded: Option<(Monitor, Config)> = None;
     let mut shown = MenuState::Loading;
     let mut warnings: Vec<String> = Vec::new();
     let mut last_refresh: Option<Instant> = None;
@@ -122,57 +196,138 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>, sender: Sender<Job>) {
             Ok(job) => job,
             Err(_) => return,
         };
-        let state = match monitor.as_mut() {
-            // Not loaded yet, e.g. the monitor was asleep at login: retry.
-            None => match load_monitor(&backend) {
+        // Not loaded yet, e.g. the monitor was asleep at login: retry.
+        let just_loaded = loaded.is_none();
+        if just_loaded {
+            match load_monitor(&backend) {
                 Ok((m, config)) => {
-                    let settings = config.monitor(&m.display);
-                    let bound = hotkeys::bindings(settings);
-                    warnings = bound.conflicts;
-                    if settings.is_none() {
-                        warnings.push(format!(
-                            "No hotkeys: the config has no entry for {}",
-                            m.display.name
-                        ));
-                    }
-                    register_hotkeys(app, bound.bindings, sender.clone());
-                    MenuState::Ready(port_entries(monitor.insert(m)), warnings.clone())
+                    warnings = bind_hotkeys(app, &m, &config, &sender);
+                    loaded = Some((m, config));
                 }
-                Err(e) => MenuState::Failed(e),
-            },
-            Some(m) => {
-                match job {
-                    Job::Refresh => {
-                        let busy = Instant::now() < quiet_until;
-                        let recent = last_refresh.is_some_and(|t| t.elapsed() < MIN_REFRESH_GAP);
-                        if busy || recent {
-                            continue;
-                        }
-                        // Keep the last known input when the read fails.
-                        if let Ok(code) = backend.get_input(&m.display) {
-                            m.active = Ok(code);
-                        }
-                        last_refresh = Some(Instant::now());
+                Err(e) => {
+                    job.fail(&e);
+                    let state = MenuState::Failed(e);
+                    if state != shown {
+                        show(app, &state);
+                        shown = state;
                     }
-                    Job::Switch(code) => match backend.set_input(&m.display, code) {
-                        // Show the request now; a later refresh confirms it.
-                        Ok(()) => {
-                            m.active = Ok(code);
-                            quiet_until = Instant::now() + QUIET_AFTER_SWITCH;
-                        }
-                        Err(e) => eprintln!("hop: could not switch to {code}: {e}"),
-                    },
-                    Job::HotkeyProblems(problems) => warnings.extend(problems),
+                    continue;
                 }
-                MenuState::Ready(port_entries(m), warnings.clone())
             }
-        };
+        }
+        let (m, config) = loaded.as_mut().expect("loaded above");
+        match job {
+            // A fresh load already read the active input.
+            Job::Refresh if just_loaded => {}
+            Job::Refresh => {
+                let busy = Instant::now() < quiet_until;
+                let recent = last_refresh.is_some_and(|t| t.elapsed() < MIN_REFRESH_GAP);
+                if busy || recent {
+                    continue;
+                }
+                // Keep the last known input when the read fails.
+                if let Ok(code) = backend.get_input(&m.display) {
+                    m.active = Ok(code);
+                }
+                last_refresh = Some(Instant::now());
+            }
+            Job::Switch(code) => match backend.set_input(&m.display, code) {
+                // Show the request now; a later refresh confirms it.
+                Ok(()) => {
+                    m.active = Ok(code);
+                    quiet_until = Instant::now() + QUIET_AFTER_SWITCH;
+                }
+                Err(e) => eprintln!("hop: could not switch to {code}: {e}"),
+            },
+            Job::HotkeyProblems(problems) => warnings.extend(problems),
+            Job::GetSettings(reply) => {
+                let _ = reply.send(Ok(settings_view(m)));
+            }
+            Job::SavePort {
+                code,
+                label,
+                hidden,
+                reply,
+            } => {
+                let result = apply_port(m, config, code, &label, hidden);
+                if result.is_ok() {
+                    // The file may have gained this monitor's entry or new
+                    // hotkeys; bind them again.
+                    warnings = bind_hotkeys(app, m, config, &sender);
+                }
+                let _ = reply.send(result);
+            }
+        }
+        let state = MenuState::Ready(port_entries(m), warnings.clone());
         // Replacing the menu can close it while it is open; only do it on a change.
         if state != shown {
             show(app, &state);
             shown = state;
         }
     }
+}
+
+/// Registers the monitor's hotkeys; returns warnings to show in the menu.
+fn bind_hotkeys(
+    app: &AppHandle,
+    m: &Monitor,
+    config: &Config,
+    sender: &Sender<Job>,
+) -> Vec<String> {
+    let settings = config.monitor(&m.display);
+    let bound = hotkeys::bindings(settings);
+    let mut warnings = bound.conflicts;
+    if settings.is_none() {
+        warnings.push(format!(
+            "No hotkeys: the config has no entry for {}",
+            m.display.name
+        ));
+    }
+    register_hotkeys(app, bound.bindings, sender.clone());
+    warnings
+}
+
+/// The Settings window's view of the monitor: every port, hidden or not.
+fn settings_view(m: &Monitor) -> Settings {
+    Settings {
+        monitor: m.display.name.clone(),
+        ports: m
+            .ports
+            .iter()
+            .map(|p| PortView {
+                code: p.code,
+                name: p.name.clone(),
+                label: p.label.clone(),
+                hidden: p.hidden,
+            })
+            .collect(),
+    }
+}
+
+/// Saves a port's label and hidden flag to the config file, then applies them
+/// to the live monitor so the menu updates at once. Re-reads the file first,
+/// so edits made by hand while Hop runs are kept.
+fn apply_port(
+    m: &mut Monitor,
+    config: &mut Config,
+    code: u8,
+    label: &str,
+    hidden: bool,
+) -> Result<(), String> {
+    let path = config::default_path();
+    let mut updated = config::load_or_create(&path, std::slice::from_ref(&m.display))
+        .map_err(|e| e.to_string())?;
+    updated.set_port(&m.display, code, label, hidden);
+    updated.save(&path).map_err(|e| e.to_string())?;
+    *config = updated;
+    let saved = config
+        .monitor(&m.display)
+        .and_then(|c| c.ports.iter().find(|p| p.code == code));
+    if let (Some(port), Some(saved)) = (m.ports.iter_mut().find(|p| p.code == code), saved) {
+        port.label = saved.label.clone();
+        port.hidden = saved.hidden;
+    }
+    Ok(())
 }
 
 fn load_monitor(backend: &dyn DdcBackend) -> Result<(Monitor, Config), String> {
@@ -213,6 +368,29 @@ fn register_hotkeys(app: &AppHandle, bindings: Vec<Binding>, jobs: Sender<Job>) 
             let _ = jobs.send(Job::HotkeyProblems(problems));
         }
     });
+}
+
+/// Shows the Settings window, creating it on first use.
+fn open_settings(app: &AppHandle) {
+    let window = match app.get_webview_window(SETTINGS_ID) {
+        Some(window) => window,
+        None => {
+            match WebviewWindowBuilder::new(app, SETTINGS_ID, WebviewUrl::App("index.html".into()))
+                .title("Hop Settings")
+                .inner_size(440.0, 300.0)
+                .resizable(false)
+                .build()
+            {
+                Ok(window) => window,
+                Err(e) => {
+                    eprintln!("hop: could not open Settings: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = window.show();
+    let _ = window.set_focus();
 }
 
 /// Rebuilds the tray menu on the main thread.
@@ -268,6 +446,7 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         }
     }
     menu.separator()
+        .item(&MenuItemBuilder::with_id(SETTINGS_ID, "Settings…").build(app)?)
         .item(&MenuItemBuilder::with_id(QUIT_ID, "Quit Hop").build(app)?)
         .build()
 }

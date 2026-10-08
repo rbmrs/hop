@@ -9,8 +9,9 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": null
-    }
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'"
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

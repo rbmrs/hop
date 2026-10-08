@@ -1,0 +1,11 @@
+  :root { color-scheme: light dark; font: 13px -apple-system, system-ui, sans-serif; }
+  body { margin: 0; padding: 16px 20px; }
+  h1 { font-size: 13px; font-weight: 600; margin: 0 0 12px; opacity: .7; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 500; opacity: .6; padding: 4px 6px; }
+  td { padding: 6px; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+  td.code { opacity: .5; font-variant-numeric: tabular-nums; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 3px 6px; font: inherit; }
+  tr.hidden td.name, tr.hidden input[type=text] { opacity: .5; }
+  #status { margin-top: 12px; min-height: 1.2em; opacity: .7; }
+  #status.error { color: #d33; opacity: 1; }

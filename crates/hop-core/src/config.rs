@@ -117,6 +117,42 @@ impl Config {
             .copied()
     }
 
+    /// Sets a port's label and hidden flag, adding the monitor and port
+    /// entries when missing. A blank label clears it; the hotkey is kept.
+    pub fn set_port(&mut self, display: &Display, code: u8, label: &str, hidden: bool) {
+        let index = match self.monitor(display) {
+            Some(m) => self
+                .monitors
+                .iter()
+                .position(|x| std::ptr::eq(x, m))
+                .unwrap(),
+            None => {
+                self.monitors.push(MonitorConfig {
+                    model: display.name.clone(),
+                    serial: display.serial.clone(),
+                    ports: Vec::new(),
+                });
+                self.monitors.len() - 1
+            }
+        };
+        let ports = &mut self.monitors[index].ports;
+        let port = match ports.iter().position(|p| p.code == code) {
+            Some(i) => &mut ports[i],
+            None => {
+                ports.push(PortConfig {
+                    code,
+                    label: None,
+                    hidden: false,
+                    hotkey: None,
+                });
+                ports.last_mut().unwrap()
+            }
+        };
+        let label = label.trim();
+        port.label = (!label.is_empty()).then(|| label.to_string());
+        port.hidden = hidden;
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::new(path, ConfigErrorKind::Serialize(e)))?;
@@ -280,5 +316,41 @@ mod tests {
         };
         assert!(config.monitor(&no_serial).is_some());
         assert!(config.monitor(&other_serial).is_some());
+    }
+
+    #[test]
+    fn set_port_renames_and_keeps_the_hotkey() {
+        let mut config = Config::defaults_for(&dell());
+        config.set_port(&dell(), 17, "Desk PC", false);
+        let port = &config.monitor(&dell()).unwrap().ports[1];
+        assert_eq!(
+            (
+                port.code,
+                port.label.as_deref(),
+                port.hidden,
+                port.hotkey.as_deref()
+            ),
+            (17, Some("Desk PC"), false, Some("Ctrl+Alt+Cmd+Minus"))
+        );
+    }
+
+    #[test]
+    fn set_port_adds_a_port_the_config_did_not_have() {
+        let mut config = Config::defaults_for(&dell());
+        config.set_port(&dell(), 15, "", true);
+        let port = &config.monitor(&dell()).unwrap().ports[2];
+        assert_eq!(
+            (port.code, port.label.as_deref(), port.hidden),
+            (15, None, true)
+        );
+    }
+
+    #[test]
+    fn set_port_adds_the_monitor_when_missing() {
+        let mut config = Config::default();
+        config.set_port(&dell(), 27, "  MacBook  ", false);
+        let monitor = config.monitor(&dell()).unwrap();
+        assert_eq!(monitor.serial.as_deref(), Some("9CY9834"));
+        assert_eq!(monitor.ports[0].label.as_deref(), Some("MacBook"));
     }
 }
