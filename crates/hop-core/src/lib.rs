@@ -3,6 +3,7 @@
 pub mod caps;
 pub mod ddc;
 pub mod monitor;
+pub mod switch;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

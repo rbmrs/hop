@@ -1,8 +1,10 @@
 //! `hop` command-line interface.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use hop_core::switch::{Readback, switch};
 use hop_core::{DdcBackend, list_monitors};
 
 #[derive(Parser)]
@@ -16,13 +18,45 @@ struct Cli {
 enum Command {
     /// List monitors, their input ports, and the active input (*).
     List,
+    /// Switch the monitor to a port: a name ("HDMI", "usb-c") or a raw VCP 0x60 code ("17", "0x11").
+    Switch { port: String },
 }
+
+/// The monitor sends null replies for about 3 s after a switch.
+const CONFIRM_FOR: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let backend = backend();
     match cli.command {
         Command::List => list(&backend),
+        Command::Switch { port } => switch_to(&backend, &port),
+    }
+}
+
+fn switch_to(backend: &dyn DdcBackend, port: &str) -> ExitCode {
+    match switch(backend, port, CONFIRM_FOR) {
+        Ok(done) => match done.readback {
+            Readback::Confirmed => ExitCode::SUCCESS,
+            Readback::Unknown(e) => {
+                eprintln!(
+                    "hop: switched to {}, but could not confirm it: {e}",
+                    done.code
+                );
+                ExitCode::SUCCESS
+            }
+            Readback::Other(got) => {
+                eprintln!(
+                    "hop: sent input {}, but the monitor reports input {got}",
+                    done.code
+                );
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("hop: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
