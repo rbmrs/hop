@@ -35,6 +35,7 @@ mod tests {
             name: name.into(),
             label: label.map(Into::into),
             hidden,
+            detected: true,
         }
     }
 

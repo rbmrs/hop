@@ -5,9 +5,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hop_core::caps;
 use hop_core::config::{self, Config};
 use hop_core::hotkeys::{self, Binding};
 use hop_core::menu::{MenuEntry, port_entries};
+use hop_core::monitor::Port;
 use hop_core::{DdcBackend, Monitor, list_monitors};
 use serde::Serialize;
 use tauri::image::Image;
@@ -49,8 +51,15 @@ enum Job {
 }
 
 enum PortChange {
-    Label { label: String, hidden: bool },
+    Label {
+        label: String,
+        hidden: bool,
+    },
     Hotkey(Option<String>),
+    /// A port the capabilities string leaves out.
+    Add,
+    /// Only for ports added by hand.
+    Remove,
 }
 
 impl Job {
@@ -72,6 +81,8 @@ impl Job {
 struct Settings {
     monitor: String,
     ports: Vec<PortView>,
+    /// (code, name) pairs for the Add port picker.
+    standard_inputs: Vec<(u8, &'static str)>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +92,7 @@ struct PortView {
     label: Option<String>,
     hidden: bool,
     hotkey: Option<String>,
+    detected: bool,
 }
 
 /// Sends a job to the DDC worker, which owns the monitor state, and waits
@@ -135,6 +147,30 @@ fn set_hotkey(
     })
 }
 
+/// Adds a port by code, written in decimal ("17") or hex ("0x11").
+#[tauri::command(async)]
+/// Returns the added port's name, so the window can show which input a
+/// typed code means (a bare "11" is decimal: Component 3, not HDMI 1).
+fn add_port(jobs: State<'_, Sender<Job>>, code: String) -> Result<String, String> {
+    let code = caps::parse_code(&code)
+        .ok_or_else(|| format!("\"{code}\" is not an input code: use 1–255 or 0x01–0xFF"))?;
+    ask(&jobs, |reply| Job::Edit {
+        code,
+        change: PortChange::Add,
+        reply,
+    })?;
+    Ok(format!("{} ({code}, 0x{code:02X})", caps::port_name(code)))
+}
+
+#[tauri::command(async)]
+fn remove_port(jobs: State<'_, Sender<Job>>, code: u8) -> Result<(), String> {
+    ask(&jobs, |reply| Job::Edit {
+        code,
+        change: PortChange::Remove,
+        reply,
+    })
+}
+
 #[tauri::command]
 fn pause_hotkeys(jobs: State<'_, Sender<Job>>) {
     let _ = jobs.send(Job::PauseHotkeys);
@@ -168,6 +204,8 @@ fn main() {
             get_settings,
             save_port,
             set_hotkey,
+            add_port,
+            remove_port,
             pause_hotkeys,
             resume_hotkeys
         ])
@@ -377,8 +415,10 @@ fn settings_view(m: &Monitor, config: &Config) -> Settings {
                 label: p.label.clone(),
                 hidden: p.hidden,
                 hotkey: hotkey(p.code),
+                detected: p.detected,
             })
             .collect(),
+        standard_inputs: caps::STANDARD_INPUTS.to_vec(),
     }
 }
 
@@ -394,14 +434,44 @@ fn apply_edit(
     let path = config::default_path();
     let mut updated = config::load_or_create(&path, std::slice::from_ref(&m.display))
         .map_err(|e| e.to_string())?;
-    match change {
-        PortChange::Label { label, hidden } => updated.set_port(&m.display, code, &label, hidden),
+    let existing = m.ports.iter().find(|p| p.code == code);
+    match &change {
+        PortChange::Label { label, hidden } => updated.set_port(&m.display, code, label, *hidden),
         PortChange::Hotkey(hotkey) => updated
             .set_hotkey(&m.display, code, hotkey.as_deref())
             .map_err(|e| e.to_string())?,
+        PortChange::Add => match existing {
+            Some(port) => {
+                return Err(format!(
+                    "Input {code} is already listed as {}",
+                    port.title()
+                ));
+            }
+            None => updated.add_port(&m.display, code),
+        },
+        PortChange::Remove => match existing {
+            Some(port) if port.detected => {
+                return Err(format!(
+                    "{} is reported by the monitor; hide it instead",
+                    port.title()
+                ));
+            }
+            _ => updated.remove_port(&m.display, code),
+        },
     }
     updated.save(&path).map_err(|e| e.to_string())?;
     *config = updated;
+    match change {
+        PortChange::Add => m.ports.push(Port {
+            code,
+            name: caps::port_name(code),
+            label: None,
+            hidden: false,
+            detected: false,
+        }),
+        PortChange::Remove => m.ports.retain(|p| p.code != code),
+        _ => {}
+    }
     let saved = config
         .monitor(&m.display)
         .and_then(|c| c.ports.iter().find(|p| p.code == code));
@@ -459,7 +529,7 @@ fn open_settings(app: &AppHandle) {
         None => {
             match WebviewWindowBuilder::new(app, SETTINGS_ID, WebviewUrl::App("index.html".into()))
                 .title("Hop Settings")
-                .inner_size(560.0, 300.0)
+                .inner_size(640.0, 380.0)
                 .resizable(false)
                 .build()
             {

@@ -34,30 +34,48 @@ pub fn input_ports(caps: &str) -> Vec<InputPort> {
 
 /// Standard MCCS names for VCP 0x60 values. 0x1B is not in MCCS 2.1, but
 /// Dell and LG use it for USB-C.
+pub const STANDARD_INPUTS: &[(u8, &str)] = &[
+    (0x01, "VGA 1"),
+    (0x02, "VGA 2"),
+    (0x03, "DVI 1"),
+    (0x04, "DVI 2"),
+    (0x05, "Composite 1"),
+    (0x06, "Composite 2"),
+    (0x07, "S-Video 1"),
+    (0x08, "S-Video 2"),
+    (0x09, "Tuner 1"),
+    (0x0A, "Tuner 2"),
+    (0x0B, "Tuner 3"),
+    (0x0C, "Component 1"),
+    (0x0D, "Component 2"),
+    (0x0E, "Component 3"),
+    (0x0F, "DP 1"),
+    (0x10, "DP 2"),
+    (0x11, "HDMI 1"),
+    (0x12, "HDMI 2"),
+    (0x1B, "USB-C"),
+];
+
+/// The standard name for a VCP 0x60 value, or "Input 0xNN".
 pub fn port_name(code: u8) -> String {
-    let name = match code {
-        0x01 => "VGA 1",
-        0x02 => "VGA 2",
-        0x03 => "DVI 1",
-        0x04 => "DVI 2",
-        0x05 => "Composite 1",
-        0x06 => "Composite 2",
-        0x07 => "S-Video 1",
-        0x08 => "S-Video 2",
-        0x09 => "Tuner 1",
-        0x0A => "Tuner 2",
-        0x0B => "Tuner 3",
-        0x0C => "Component 1",
-        0x0D => "Component 2",
-        0x0E => "Component 3",
-        0x0F => "DP 1",
-        0x10 => "DP 2",
-        0x11 => "HDMI 1",
-        0x12 => "HDMI 2",
-        0x1B => "USB-C",
-        _ => return format!("Input 0x{code:02X}"),
+    STANDARD_INPUTS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or_else(
+            || format!("Input 0x{code:02X}"),
+            |(_, name)| name.to_string(),
+        )
+}
+
+/// Parses a VCP 0x60 input code written in decimal ("17") or hex ("0x11").
+/// 0 is not a valid input.
+pub fn parse_code(text: &str) -> Option<u8> {
+    let t = text.trim();
+    let code = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16).ok()?,
+        None => t.parse().ok()?,
     };
-    name.to_string()
+    (code != 0).then_some(code)
 }
 
 /// Content of the top-level `name(...)` group, without its parentheses.
@@ -171,5 +189,26 @@ mod tests {
     fn unknown_codes_get_a_hex_name() {
         let ports = input_ports("(vcp(60(0F 31)))");
         assert_eq!(ports[1].name, "Input 0x31");
+    }
+
+    #[test]
+    fn parses_decimal_and_hex_input_codes() {
+        assert_eq!(parse_code("17"), Some(17));
+        assert_eq!(parse_code(" 0x11 "), Some(17));
+        assert_eq!(parse_code("0X1b"), Some(27));
+        assert_eq!(parse_code("255"), Some(255));
+    }
+
+    #[test]
+    fn rejects_zero_out_of_range_and_text() {
+        for bad in ["0", "0x0", "256", "0x100", "-1", "hdmi", ""] {
+            assert_eq!(parse_code(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn standard_inputs_list_the_mccs_names() {
+        assert!(STANDARD_INPUTS.contains(&(0x11, "HDMI 1")));
+        assert!(STANDARD_INPUTS.contains(&(0x1B, "USB-C")));
     }
 }

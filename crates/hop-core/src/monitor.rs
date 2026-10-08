@@ -52,6 +52,8 @@ pub struct Port {
     pub name: String,
     pub label: Option<String>,
     pub hidden: bool,
+    /// False for a port added by hand that the monitor does not report.
+    pub detected: bool,
 }
 
 impl Port {
@@ -81,6 +83,7 @@ pub fn ports_for(detected: &[InputPort], config: Option<&MonitorConfig>) -> Vec<
             name: d.name.clone(),
             label: setting(d.code).and_then(|s| s.label.clone()),
             hidden: setting(d.code).is_some_and(|s| s.hidden),
+            detected: true,
         })
         .collect();
     for s in settings {
@@ -90,6 +93,7 @@ pub fn ports_for(detected: &[InputPort], config: Option<&MonitorConfig>) -> Vec<
                 name: caps::port_name(s.code),
                 label: s.label.clone(),
                 hidden: s.hidden,
+                detected: false,
             });
         }
     }
@@ -311,5 +315,17 @@ mod tests {
         )
         .unwrap();
         assert!(render_with(&backend, &config).contains("  * DP 1    15\n"));
+    }
+
+    #[test]
+    fn ports_from_the_config_only_are_marked_manual() {
+        let detected = caps::input_ports(CAPS);
+        let config = Config::parse(
+            "[[monitor]]\nmodel = \"DELL U3223QE\"\n[[monitor.port]]\ncode = 17\nlabel = \"Linux\"\n[[monitor.port]]\ncode = 16\n",
+        )
+        .unwrap();
+        let ports = ports_for(&detected, config.monitor(&dell()));
+        let flags: Vec<(u8, bool)> = ports.iter().map(|p| (p.code, p.detected)).collect();
+        assert_eq!(flags, vec![(27, true), (15, true), (17, true), (16, false)]);
     }
 }

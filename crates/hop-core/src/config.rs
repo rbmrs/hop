@@ -169,15 +169,28 @@ impl Config {
         Ok(())
     }
 
+    /// Adds a port entry, e.g. an input the capabilities string leaves out.
+    pub fn add_port(&mut self, display: &Display, code: u8) {
+        self.port_mut(display, code);
+    }
+
+    /// Removes a port's entry: its label, hidden flag and hotkey.
+    pub fn remove_port(&mut self, display: &Display, code: u8) {
+        if let Some(index) = self.monitor_index(display) {
+            self.monitors[index].ports.retain(|p| p.code != code);
+        }
+    }
+
+    fn monitor_index(&self, display: &Display) -> Option<usize> {
+        let m = self.monitor(display)?;
+        self.monitors.iter().position(|x| std::ptr::eq(x, m))
+    }
+
     /// The settings for a port, adding the monitor and port entries when
     /// missing.
     fn port_mut(&mut self, display: &Display, code: u8) -> &mut PortConfig {
-        let index = match self.monitor(display) {
-            Some(m) => self
-                .monitors
-                .iter()
-                .position(|x| std::ptr::eq(x, m))
-                .unwrap(),
+        let index = match self.monitor_index(display) {
+            Some(index) => index,
             None => {
                 self.monitors.push(MonitorConfig {
                     model: display.name.clone(),
@@ -456,5 +469,34 @@ mod tests {
             (port.code, port.hotkey.as_deref()),
             (15, Some("Ctrl+Alt+Cmd+D"))
         );
+    }
+
+    #[test]
+    fn add_port_adds_an_entry_once() {
+        let mut config = Config::defaults_for(&dell());
+        config.add_port(&dell(), 0x10);
+        config.add_port(&dell(), 0x10);
+        let codes: Vec<u8> = config
+            .monitor(&dell())
+            .unwrap()
+            .ports
+            .iter()
+            .map(|p| p.code)
+            .collect();
+        assert_eq!(codes, vec![27, 17, 0x10]);
+    }
+
+    #[test]
+    fn remove_port_deletes_the_entry() {
+        let mut config = Config::defaults_for(&dell());
+        config.remove_port(&dell(), 17);
+        let codes: Vec<u8> = config
+            .monitor(&dell())
+            .unwrap()
+            .ports
+            .iter()
+            .map(|p| p.code)
+            .collect();
+        assert_eq!(codes, vec![27]);
     }
 }

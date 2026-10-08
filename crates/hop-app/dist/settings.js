@@ -112,8 +112,18 @@ async function load() {
       row.classList.toggle('hidden', port.hidden);
       row.innerHTML = '<td class="name"></td><td><input type="text"></td>' +
         '<td class="hotkey"><button class="record"></button><button class="clear" title="Clear hotkey">×</button></td>' +
-        '<td><input type="checkbox"></td><td class="code"></td>';
+        '<td><input type="checkbox"></td><td class="code"></td><td class="remove"></td>';
       row.querySelector('.name').textContent = port.name;
+      if (!port.detected) {
+        const tag = document.createElement('span');
+        tag.className = 'manual';
+        tag.textContent = 'added';
+        row.querySelector('.name').append(tag);
+        const remove = document.createElement('button');
+        remove.textContent = 'Remove';
+        remove.addEventListener('click', () => removePort(port));
+        row.querySelector('.remove').append(remove);
+      }
       row.querySelector('.code').textContent = port.code;
       const label = row.querySelector('input[type=text]');
       label.value = port.label ?? '';
@@ -137,6 +147,45 @@ async function load() {
       hide.addEventListener('change', () => save(row, port));
       body.append(row);
     }
+    fillStandardInputs(s.standard_inputs);
+  } catch (e) {
+    say(String(e), true);
+  }
+}
+
+function fillStandardInputs(inputs) {
+  const select = document.getElementById('standard');
+  if (select.options.length > 1) return;
+  for (const [code, name] of inputs) {
+    const option = document.createElement('option');
+    option.value = code;
+    option.textContent = `${name} (${code})`;
+    select.append(option);
+  }
+}
+
+document.getElementById('standard').addEventListener('change', (e) => {
+  document.getElementById('code').value = e.target.value;
+});
+
+document.getElementById('add').addEventListener('click', async () => {
+  const field = document.getElementById('code');
+  try {
+    const added = await invoke('add_port', { code: field.value });
+    field.value = '';
+    document.getElementById('standard').value = '';
+    say(`Added ${added}`);
+    await load();
+  } catch (e) {
+    say(String(e), true);
+  }
+});
+
+async function removePort(port) {
+  try {
+    await invoke('remove_port', { code: port.code });
+    say('Port removed');
+    await load();
   } catch (e) {
     say(String(e), true);
   }

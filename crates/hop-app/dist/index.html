@@ -8,9 +8,18 @@
 <body>
 <h1 id="monitor">Reading monitor…</h1>
 <table>
-  <thead><tr><th>Port</th><th>Label</th><th>Hotkey</th><th>Hide</th><th>Code</th></tr></thead>
+  <thead><tr><th>Port</th><th>Label</th><th>Hotkey</th><th>Hide</th><th>Code</th><th></th></tr></thead>
   <tbody id="ports"></tbody>
 </table>
+<details id="advanced">
+  <summary>Advanced</summary>
+  <p>Add a port the monitor does not report. Pick a standard input, or type a raw VCP 0x60 code.</p>
+  <div class="add">
+    <select id="standard"><option value="">Standard input…</option></select>
+    <input type="text" id="code" placeholder="Decimal (16) or hex (0x10)">
+    <button id="add">Add port</button>
+  </div>
+</details>
 <div id="status"></div>
 <script src="settings.js"></script>
 </body>

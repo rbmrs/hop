@@ -13,3 +13,10 @@
   td.hotkey button { font: inherit; min-width: 7.5em; padding: 2px 8px; }
   td.hotkey button.recording { outline: 2px solid AccentColor; }
   td.hotkey button.clear { min-width: 0; padding: 2px 6px; margin-left: 4px; }
+  td.remove button { font: inherit; padding: 2px 8px; }
+  td.name .manual { opacity: .5; font-size: 11px; margin-left: 4px; }
+  details { margin-top: 14px; }
+  summary { cursor: default; opacity: .8; }
+  details p { opacity: .7; margin: 8px 0; }
+  .add { display: flex; gap: 6px; }
+  .add input { flex: 1; padding: 3px 6px; font: inherit; }

@@ -36,7 +36,7 @@ impl std::error::Error for ResolveError {}
 /// dashes ("linux", "usb-c"), or a name without its number when only one
 /// port matches ("HDMI"). Labels win over detected names.
 pub fn resolve_port(ports: &[Port], query: &str) -> Result<u8, ResolveError> {
-    if let Some(code) = raw_code(query) {
+    if let Some(code) = caps::parse_code(query) {
         return Ok(code);
     }
     if let Some(code) = label_match(ports, query) {
@@ -73,14 +73,6 @@ fn label_match(ports: &[Port], query: &str) -> Option<u8> {
         .iter()
         .find(|p| p.label.as_deref().is_some_and(|l| normalize(l) == q))
         .map(|p| p.code)
-}
-
-fn raw_code(query: &str) -> Option<u8> {
-    let q = query.trim();
-    match q.strip_prefix("0x").or_else(|| q.strip_prefix("0X")) {
-        Some(hex) => u8::from_str_radix(hex, 16).ok(),
-        None => q.parse().ok(),
-    }
 }
 
 fn normalize(s: &str) -> String {
@@ -160,7 +152,7 @@ pub fn switch(
         .ok_or(SwitchError::NoDisplay)?;
     let settings = config.monitor(&display);
     // A raw code or a label needs no capabilities read, which takes about 1 s.
-    let quick = raw_code(query).or_else(|| label_match(&ports_for(&[], settings), query));
+    let quick = caps::parse_code(query).or_else(|| label_match(&ports_for(&[], settings), query));
     let code = match quick {
         Some(code) => code,
         None => {
@@ -212,6 +204,7 @@ mod tests {
             name: name.into(),
             label: label.map(Into::into),
             hidden: false,
+            detected: true,
         }
     }
 
