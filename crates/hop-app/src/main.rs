@@ -13,7 +13,9 @@ use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Wry};
+use tauri::{
+    AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 const TRAY_ID: &str = "hop";
@@ -33,12 +35,22 @@ enum Job {
     /// Hotkeys that could not be registered, to show in the menu.
     HotkeyProblems(Vec<String>),
     GetSettings(Sender<Result<Settings, String>>),
-    SavePort {
+    /// Saves one port's settings to the config file.
+    Edit {
         code: u8,
-        label: String,
-        hidden: bool,
+        change: PortChange,
         reply: Sender<Result<(), String>>,
     },
+    /// Stops the hotkeys while the Settings window records a new one, so
+    /// pressing a current hotkey does not switch the monitor.
+    PauseHotkeys,
+    /// Registers the hotkeys again after a recording ends or is cancelled.
+    ResumeHotkeys,
+}
+
+enum PortChange {
+    Label { label: String, hidden: bool },
+    Hotkey(Option<String>),
 }
 
 impl Job {
@@ -48,7 +60,7 @@ impl Job {
             Job::GetSettings(reply) => {
                 let _ = reply.send(Err(error.to_string()));
             }
-            Job::SavePort { reply, .. } => {
+            Job::Edit { reply, .. } => {
                 let _ = reply.send(Err(error.to_string()));
             }
             _ => {}
@@ -68,6 +80,7 @@ struct PortView {
     name: String,
     label: Option<String>,
     hidden: bool,
+    hotkey: Option<String>,
 }
 
 /// Sends a job to the DDC worker, which owns the monitor state, and waits
@@ -94,12 +107,42 @@ fn save_port(
     label: String,
     hidden: bool,
 ) -> Result<(), String> {
-    ask(&jobs, |reply| Job::SavePort {
+    let change = PortChange::Label { label, hidden };
+    ask(&jobs, |reply| Job::Edit {
         code,
-        label,
-        hidden,
+        change,
         reply,
     })
+}
+
+/// Sets a port's hotkey, or clears it when `hotkey` is null.
+#[tauri::command(async)]
+fn set_hotkey(
+    jobs: State<'_, Sender<Job>>,
+    code: u8,
+    hotkey: Option<String>,
+) -> Result<(), String> {
+    if let Some(hotkey) = &hotkey {
+        hotkey
+            .parse::<tauri_plugin_global_shortcut::Shortcut>()
+            .map_err(|e| format!("{hotkey} cannot be used: {e}"))?;
+    }
+    let change = PortChange::Hotkey(hotkey);
+    ask(&jobs, |reply| Job::Edit {
+        code,
+        change,
+        reply,
+    })
+}
+
+#[tauri::command]
+fn pause_hotkeys(jobs: State<'_, Sender<Job>>) {
+    let _ = jobs.send(Job::PauseHotkeys);
+}
+
+#[tauri::command]
+fn resume_hotkeys(jobs: State<'_, Sender<Job>>) {
+    let _ = jobs.send(Job::ResumeHotkeys);
 }
 
 /// What the menu shows.
@@ -114,7 +157,20 @@ enum MenuState {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![get_settings, save_port])
+        .on_window_event(|window, event| {
+            // A recording may still be running when Settings closes; make
+            // sure the hotkeys come back.
+            if window.label() == SETTINGS_ID && matches!(event, WindowEvent::Destroyed) {
+                let _ = window.state::<Sender<Job>>().send(Job::ResumeHotkeys);
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            save_port,
+            set_hotkey,
+            pause_hotkeys,
+            resume_hotkeys
+        ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -186,6 +242,8 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>, sender: Sender<Job>) {
     let mut loaded: Option<(Monitor, Config)> = None;
     let mut shown = MenuState::Loading;
     let mut warnings: Vec<String> = Vec::new();
+    // True while the Settings window records a hotkey.
+    let mut paused = false;
     let mut last_refresh: Option<Instant> = None;
     // No reads until the monitor's null replies after a switch are over.
     let mut quiet_until = Instant::now();
@@ -239,23 +297,36 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>, sender: Sender<Job>) {
                 }
                 Err(e) => eprintln!("hop: could not switch to {code}: {e}"),
             },
-            Job::HotkeyProblems(problems) => warnings.extend(problems),
-            Job::GetSettings(reply) => {
-                let _ = reply.send(Ok(settings_view(m)));
+            Job::HotkeyProblems(problems) => {
+                for problem in problems {
+                    if !warnings.contains(&problem) {
+                        warnings.push(problem);
+                    }
+                }
             }
-            Job::SavePort {
+            Job::GetSettings(reply) => {
+                let _ = reply.send(Ok(settings_view(m, config)));
+            }
+            Job::Edit {
                 code,
-                label,
-                hidden,
+                change,
                 reply,
             } => {
-                let result = apply_port(m, config, code, &label, hidden);
-                if result.is_ok() {
+                let result = apply_edit(m, config, code, change);
+                if result.is_ok() && !paused {
                     // The file may have gained this monitor's entry or new
-                    // hotkeys; bind them again.
+                    // hotkeys; bind them again, with fresh warnings.
                     warnings = bind_hotkeys(app, m, config, &sender);
                 }
                 let _ = reply.send(result);
+            }
+            Job::PauseHotkeys => {
+                paused = true;
+                register_hotkeys(app, Vec::new(), sender.clone());
+            }
+            Job::ResumeHotkeys => {
+                paused = false;
+                warnings = bind_hotkeys(app, m, config, &sender);
             }
         }
         let state = MenuState::Ready(port_entries(m), warnings.clone());
@@ -288,7 +359,13 @@ fn bind_hotkeys(
 }
 
 /// The Settings window's view of the monitor: every port, hidden or not.
-fn settings_view(m: &Monitor) -> Settings {
+fn settings_view(m: &Monitor, config: &Config) -> Settings {
+    let settings = config.monitor(&m.display);
+    let hotkey = |code| {
+        settings
+            .and_then(|s| s.ports.iter().find(|p| p.code == code))
+            .and_then(|p| p.hotkey.clone())
+    };
     Settings {
         monitor: m.display.name.clone(),
         ports: m
@@ -299,25 +376,30 @@ fn settings_view(m: &Monitor) -> Settings {
                 name: p.name.clone(),
                 label: p.label.clone(),
                 hidden: p.hidden,
+                hotkey: hotkey(p.code),
             })
             .collect(),
     }
 }
 
-/// Saves a port's label and hidden flag to the config file, then applies them
-/// to the live monitor so the menu updates at once. Re-reads the file first,
-/// so edits made by hand while Hop runs are kept.
-fn apply_port(
+/// Saves one port's settings to the config file, then applies them to the
+/// live monitor so the menu updates at once. Re-reads the file first, so
+/// edits made by hand while Hop runs are kept.
+fn apply_edit(
     m: &mut Monitor,
     config: &mut Config,
     code: u8,
-    label: &str,
-    hidden: bool,
+    change: PortChange,
 ) -> Result<(), String> {
     let path = config::default_path();
     let mut updated = config::load_or_create(&path, std::slice::from_ref(&m.display))
         .map_err(|e| e.to_string())?;
-    updated.set_port(&m.display, code, label, hidden);
+    match change {
+        PortChange::Label { label, hidden } => updated.set_port(&m.display, code, &label, hidden),
+        PortChange::Hotkey(hotkey) => updated
+            .set_hotkey(&m.display, code, hotkey.as_deref())
+            .map_err(|e| e.to_string())?,
+    }
     updated.save(&path).map_err(|e| e.to_string())?;
     *config = updated;
     let saved = config
@@ -377,7 +459,7 @@ fn open_settings(app: &AppHandle) {
         None => {
             match WebviewWindowBuilder::new(app, SETTINGS_ID, WebviewUrl::App("index.html".into()))
                 .title("Hop Settings")
-                .inner_size(440.0, 300.0)
+                .inner_size(560.0, 300.0)
                 .resizable(false)
                 .build()
             {

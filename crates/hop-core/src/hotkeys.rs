@@ -43,10 +43,16 @@ pub fn bindings(config: Option<&MonitorConfig>) -> Bindings {
     out
 }
 
-fn port_title(port: &PortConfig) -> String {
+/// The port's label, or its detected name.
+pub(crate) fn port_title(port: &PortConfig) -> String {
     port.label
         .clone()
         .unwrap_or_else(|| caps::port_name(port.code))
+}
+
+/// Whether two hotkey strings mean the same keys.
+pub fn same_hotkey(a: &str, b: &str) -> bool {
+    normalize(a) == normalize(b)
 }
 
 /// Same hotkey regardless of case, key order, and modifier aliases
@@ -60,7 +66,11 @@ fn normalize(hotkey: &str) -> String {
                 "control" => "ctrl".into(),
                 "option" => "alt".into(),
                 "command" | "super" => "cmd".into(),
-                _ => k,
+                // Key codes ("KeyA", "Digit0") name the same keys as "A", "0".
+                _ => match k.strip_prefix("key").or_else(|| k.strip_prefix("digit")) {
+                    Some(rest) if rest.len() == 1 => rest.to_string(),
+                    _ => k,
+                },
             }
         })
         .collect();
@@ -144,5 +154,12 @@ mod tests {
             "[[monitor]]\nmodel = \"M\"\n[[monitor.port]]\ncode = 27\nhotkey = \"Ctrl+Alt+Cmd+Equal\"\n[[monitor.port]]\ncode = 17\nhotkey = \"Control+Option+Command+Equal\"\n",
         );
         assert_eq!(bindings(Some(&m)).conflicts.len(), 1);
+    }
+
+    #[test]
+    fn key_code_names_match_their_short_names() {
+        assert!(same_hotkey("Ctrl+KeyA", "ctrl+a"));
+        assert!(same_hotkey("Cmd+Digit0", "Command+0"));
+        assert!(!same_hotkey("Ctrl+KeyA", "Ctrl+B"));
     }
 }

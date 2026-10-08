@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hotkeys;
 use crate::monitor::{DdcBackend, Display};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +75,22 @@ impl ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// A hotkey that another port already uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyTaken {
+    pub hotkey: String,
+    /// The other port's label, or its detected name.
+    pub owner: String,
+}
+
+impl fmt::Display for HotkeyTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is already used by {}", self.hotkey, self.owner)
+    }
+}
+
+impl std::error::Error for HotkeyTaken {}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
@@ -120,6 +137,41 @@ impl Config {
     /// Sets a port's label and hidden flag, adding the monitor and port
     /// entries when missing. A blank label clears it; the hotkey is kept.
     pub fn set_port(&mut self, display: &Display, code: u8, label: &str, hidden: bool) {
+        let port = self.port_mut(display, code);
+        let label = label.trim();
+        port.label = (!label.is_empty()).then(|| label.to_string());
+        port.hidden = hidden;
+    }
+
+    /// Sets or clears a port's hotkey. Rejects a hotkey that another port on
+    /// the same monitor uses (in any case, key order or modifier alias).
+    pub fn set_hotkey(
+        &mut self,
+        display: &Display,
+        code: u8,
+        hotkey: Option<&str>,
+    ) -> Result<(), HotkeyTaken> {
+        if let (Some(hotkey), Some(monitor)) = (hotkey, self.monitor(display)) {
+            let owner = monitor.ports.iter().find(|p| {
+                p.code != code
+                    && p.hotkey
+                        .as_deref()
+                        .is_some_and(|h| hotkeys::same_hotkey(h, hotkey))
+            });
+            if let Some(owner) = owner {
+                return Err(HotkeyTaken {
+                    hotkey: hotkey.to_string(),
+                    owner: hotkeys::port_title(owner),
+                });
+            }
+        }
+        self.port_mut(display, code).hotkey = hotkey.map(str::to_string);
+        Ok(())
+    }
+
+    /// The settings for a port, adding the monitor and port entries when
+    /// missing.
+    fn port_mut(&mut self, display: &Display, code: u8) -> &mut PortConfig {
         let index = match self.monitor(display) {
             Some(m) => self
                 .monitors
@@ -136,7 +188,7 @@ impl Config {
             }
         };
         let ports = &mut self.monitors[index].ports;
-        let port = match ports.iter().position(|p| p.code == code) {
+        match ports.iter().position(|p| p.code == code) {
             Some(i) => &mut ports[i],
             None => {
                 ports.push(PortConfig {
@@ -147,10 +199,7 @@ impl Config {
                 });
                 ports.last_mut().unwrap()
             }
-        };
-        let label = label.trim();
-        port.label = (!label.is_empty()).then(|| label.to_string());
-        port.hidden = hidden;
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
@@ -352,5 +401,60 @@ mod tests {
         let monitor = config.monitor(&dell()).unwrap();
         assert_eq!(monitor.serial.as_deref(), Some("9CY9834"));
         assert_eq!(monitor.ports[0].label.as_deref(), Some("MacBook"));
+    }
+
+    #[test]
+    fn set_hotkey_replaces_the_old_one() {
+        let mut config = Config::defaults_for(&dell());
+        config
+            .set_hotkey(&dell(), 17, Some("Ctrl+Shift+F12"))
+            .unwrap();
+        let port = &config.monitor(&dell()).unwrap().ports[1];
+        assert_eq!(port.hotkey.as_deref(), Some("Ctrl+Shift+F12"));
+        assert_eq!(port.label.as_deref(), Some("Linux"));
+    }
+
+    #[test]
+    fn set_hotkey_rejects_a_hotkey_another_port_uses() {
+        let mut config = Config::defaults_for(&dell());
+        let err = config
+            .set_hotkey(&dell(), 17, Some("Command+Control+Option+Equal"))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Command+Control+Option+Equal is already used by MacBook"
+        );
+        let port = &config.monitor(&dell()).unwrap().ports[1];
+        assert_eq!(port.hotkey.as_deref(), Some("Ctrl+Alt+Cmd+Minus"));
+    }
+
+    #[test]
+    fn setting_a_port_s_own_hotkey_again_is_allowed() {
+        let mut config = Config::defaults_for(&dell());
+        assert!(
+            config
+                .set_hotkey(&dell(), 17, Some("Ctrl+Alt+Cmd+Minus"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn set_hotkey_none_clears_it() {
+        let mut config = Config::defaults_for(&dell());
+        config.set_hotkey(&dell(), 27, None).unwrap();
+        assert_eq!(config.monitor(&dell()).unwrap().ports[0].hotkey, None);
+    }
+
+    #[test]
+    fn set_hotkey_adds_a_port_the_config_did_not_have() {
+        let mut config = Config::default();
+        config
+            .set_hotkey(&dell(), 15, Some("Ctrl+Alt+Cmd+D"))
+            .unwrap();
+        let port = &config.monitor(&dell()).unwrap().ports[0];
+        assert_eq!(
+            (port.code, port.hotkey.as_deref()),
+            (15, Some("Ctrl+Alt+Cmd+D"))
+        );
     }
 }
