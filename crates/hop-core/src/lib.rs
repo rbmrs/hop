@@ -3,6 +3,7 @@
 pub mod caps;
 pub mod config;
 pub mod ddc;
+pub mod hotkeys;
 pub mod menu;
 pub mod monitor;
 pub mod switch;

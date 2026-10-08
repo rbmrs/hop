@@ -1,17 +1,19 @@
 //! Hop tray app: a menu bar icon whose menu lists the monitor's ports,
-//! checks the active one, and switches on click.
+//! checks the active one, and switches on click or on a global hotkey.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hop_core::config;
+use hop_core::config::{self, Config};
+use hop_core::hotkeys::{self, Binding};
 use hop_core::menu::{MenuEntry, port_entries};
 use hop_core::{DdcBackend, Monitor, list_monitors};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, RunEvent, Wry};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 const TRAY_ID: &str = "hop";
 const QUIT_ID: &str = "quit";
@@ -26,18 +28,22 @@ const QUIET_AFTER_SWITCH: Duration = Duration::from_secs(4);
 enum Job {
     Refresh,
     Switch(u8),
+    /// Hotkeys that could not be registered, to show in the menu.
+    HotkeyProblems(Vec<String>),
 }
 
 /// What the menu shows.
 #[derive(Clone, PartialEq)]
 enum MenuState {
     Loading,
-    Ready(Vec<MenuEntry>),
+    /// Port entries, then warnings such as hotkeys that failed to register.
+    Ready(Vec<MenuEntry>, Vec<String>),
     Failed(String),
 }
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -65,7 +71,8 @@ fn main() {
                 .build(app)?;
 
             let handle = app.handle().clone();
-            thread::spawn(move || ddc_worker(&handle, rx));
+            let worker_jobs = jobs.clone();
+            thread::spawn(move || ddc_worker(&handle, rx, worker_jobs));
             thread::spawn(move || {
                 loop {
                     thread::sleep(REFRESH_EVERY);
@@ -100,10 +107,11 @@ fn on_menu_click(app: &AppHandle, id: &str, jobs: &Sender<Job>) {
 
 /// Owns the DDC backend. Reads ports once (the capabilities read takes about
 /// 1 s), then only re-reads the active input.
-fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>) {
+fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>, sender: Sender<Job>) {
     let backend = hop_core::default_backend();
     let mut monitor: Option<Monitor> = None;
     let mut shown = MenuState::Loading;
+    let mut warnings: Vec<String> = Vec::new();
     let mut last_refresh: Option<Instant> = None;
     // No reads until the monitor's null replies after a switch are over.
     let mut quiet_until = Instant::now();
@@ -117,7 +125,19 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>) {
         let state = match monitor.as_mut() {
             // Not loaded yet, e.g. the monitor was asleep at login: retry.
             None => match load_monitor(&backend) {
-                Ok(m) => MenuState::Ready(port_entries(monitor.insert(m))),
+                Ok((m, config)) => {
+                    let settings = config.monitor(&m.display);
+                    let bound = hotkeys::bindings(settings);
+                    warnings = bound.conflicts;
+                    if settings.is_none() {
+                        warnings.push(format!(
+                            "No hotkeys: the config has no entry for {}",
+                            m.display.name
+                        ));
+                    }
+                    register_hotkeys(app, bound.bindings, sender.clone());
+                    MenuState::Ready(port_entries(monitor.insert(m)), warnings.clone())
+                }
                 Err(e) => MenuState::Failed(e),
             },
             Some(m) => {
@@ -142,8 +162,9 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>) {
                         }
                         Err(e) => eprintln!("hop: could not switch to {code}: {e}"),
                     },
+                    Job::HotkeyProblems(problems) => warnings.extend(problems),
                 }
-                MenuState::Ready(port_entries(m))
+                MenuState::Ready(port_entries(m), warnings.clone())
             }
         };
         // Replacing the menu can close it while it is open; only do it on a change.
@@ -154,13 +175,44 @@ fn ddc_worker(app: &AppHandle, jobs: Receiver<Job>) {
     }
 }
 
-fn load_monitor(backend: &dyn DdcBackend) -> Result<Monitor, String> {
+fn load_monitor(backend: &dyn DdcBackend) -> Result<(Monitor, Config), String> {
     let config = config::load_for(backend).map_err(|e| e.to_string())?;
-    list_monitors(backend, &config)
+    let monitor = list_monitors(backend, &config)
         .map_err(|e| e.to_string())?
         .into_iter()
         .next()
-        .ok_or_else(|| "No DDC/CI monitor found".to_string())
+        .ok_or_else(|| "No DDC/CI monitor found".to_string())?;
+    Ok((monitor, config))
+}
+
+/// Registers each binding on the main thread. Carbon hotkeys on macOS need
+/// no Accessibility or Input Monitoring permission. Failures go back to the
+/// worker, which shows them in the menu.
+fn register_hotkeys(app: &AppHandle, bindings: Vec<Binding>, jobs: Sender<Job>) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let shortcuts = handle.global_shortcut();
+        let _ = shortcuts.unregister_all();
+        let mut problems = Vec::new();
+        for Binding { hotkey, code } in bindings {
+            let on_press = {
+                let jobs = jobs.clone();
+                move |_: &AppHandle, _: &_, event: tauri_plugin_global_shortcut::ShortcutEvent| {
+                    if event.state() == ShortcutState::Pressed {
+                        let _ = jobs.send(Job::Switch(code));
+                    }
+                }
+            };
+            if let Err(e) = shortcuts.on_shortcut(hotkey.as_str(), on_press) {
+                let problem = format!("Hotkey {hotkey} is not active: {e}");
+                eprintln!("hop: {problem}");
+                problems.push(problem);
+            }
+        }
+        if !problems.is_empty() {
+            let _ = jobs.send(Job::HotkeyProblems(problems));
+        }
+    });
 }
 
 /// Rebuilds the tray menu on the main thread.
@@ -193,7 +245,17 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
         MenuState::Failed(e) => {
             menu = menu.item(&MenuItemBuilder::new(e).enabled(false).build(app)?);
         }
-        MenuState::Ready(entries) => {
+        MenuState::Ready(entries, warnings) => {
+            for warning in warnings {
+                menu = menu.item(
+                    &MenuItemBuilder::new(format!("⚠ {warning}"))
+                        .enabled(false)
+                        .build(app)?,
+                );
+            }
+            if !warnings.is_empty() {
+                menu = menu.separator();
+            }
             for entry in entries {
                 let item = CheckMenuItemBuilder::with_id(
                     format!("{PORT_PREFIX}{}", entry.code),

@@ -13,3 +13,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 hop-core = { path = "../hop-core" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
