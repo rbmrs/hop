@@ -1,6 +1,7 @@
 //! Core of Hop: DDC/CI input switching, independent of the UI.
 
 pub mod caps;
+pub mod config;
 pub mod ddc;
 pub mod monitor;
 pub mod switch;

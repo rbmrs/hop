@@ -57,12 +57,14 @@ macOS Shortcuts + `m1ddc` setup.
 
 ## Config
 
-A single JSON/TOML file in the platform config dir, same schema on both OSes
-so it can be copied between machines. Sketch:
+A single TOML file, `hop/config.toml` in the platform config dir
+(`$HOP_CONFIG` overrides it). Same schema on both OSes, so it can be copied
+between machines. Schema:
 
 ```toml
 [[monitor]]
-id = "DELL U3223QE"          # match by model/serial, not volatile UUID
+model = "DELL U3223QE"       # EDID product name
+serial = "9CY9834"           # optional; matched first, then model alone
 
   [[monitor.port]]
   code = 27                  # VCP 0x60 value

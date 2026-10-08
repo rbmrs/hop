@@ -3,7 +3,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_foundation::base::{CFType, CFTypeRef, TCFType, kCFAllocatorDefault};
 use core_foundation::dictionary::CFDictionary;
@@ -58,6 +58,9 @@ const REPLY_DELAY: Duration = Duration::from_millis(50);
 /// Extra wait when the display answers with a null message (busy).
 const BUSY_DELAY: Duration = Duration::from_millis(200);
 const RETRIES: usize = 5;
+/// The monitor sends null replies for about 3 s after a switch; keep retrying
+/// those for this long before giving up.
+const BUSY_WINDOW: Duration = Duration::from_secs(4);
 /// MCCS strings are well under 1 KiB; stop a monitor that never ends one.
 const MAX_CAPS_LEN: usize = 8 * 1024;
 
@@ -135,30 +138,35 @@ impl DdcBackend for MacBackend {
     }
 }
 
-/// Sends a request and decodes the reply, retrying on invalid replies.
+/// Sends a request and decodes the reply. Invalid replies are retried
+/// `RETRIES` times; null replies (busy) are retried for up to `BUSY_WINDOW`.
 fn transact<T>(
     av: &CFType,
     request: &[u8],
     reply_len: usize,
     decode: impl Fn(&[u8]) -> Result<T, ReplyError>,
 ) -> Result<T, Error> {
-    let mut last = Error::Transport("no attempt made".into());
-    for _ in 0..RETRIES {
+    let busy_until = Instant::now() + BUSY_WINDOW;
+    let mut failures = 0;
+    loop {
         let result = write(av, request).and_then(|()| {
             sleep(REPLY_DELAY);
             let reply = read(av, reply_len)?;
             decode(&reply).map_err(Error::Reply)
         });
-        match result {
+        let e = match result {
             Ok(value) => return Ok(value),
-            Err(e) => {
-                let busy = matches!(e, Error::Reply(ReplyError::Null));
-                sleep(if busy { BUSY_DELAY } else { REPLY_DELAY });
-                last = e;
-            }
+            Err(e) => e,
+        };
+        let busy = matches!(e, Error::Reply(ReplyError::Null));
+        if !busy {
+            failures += 1;
         }
+        if failures >= RETRIES || (busy && Instant::now() >= busy_until) {
+            return Err(e);
+        }
+        sleep(if busy { BUSY_DELAY } else { REPLY_DELAY });
     }
-    Err(last)
 }
 
 fn write(av: &CFType, data: &[u8]) -> Result<(), Error> {

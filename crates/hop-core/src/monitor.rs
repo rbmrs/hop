@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::caps::{self, InputPort};
+use crate::config::{Config, MonitorConfig};
 use crate::ddc::ReplyError;
 
 /// A monitor reachable over DDC/CI.
@@ -42,30 +43,79 @@ pub trait DdcBackend {
     fn set_input(&self, display: &Display, code: u8) -> Result<(), Error>;
 }
 
-/// A display with its detected input ports and the active input.
+/// An input port: what the monitor reports, plus the user's settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Port {
+    /// VCP 0x60 value.
+    pub code: u8,
+    /// Detected name, e.g. "HDMI 1".
+    pub name: String,
+    pub label: Option<String>,
+    pub hidden: bool,
+}
+
+impl Port {
+    /// "Linux (HDMI 1)" with a label, else "HDMI 1".
+    pub fn title(&self) -> String {
+        match &self.label {
+            Some(label) => format!("{label} ({})", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Merges detected ports with the monitor's settings. Configured ports the
+/// capabilities string omits are kept, after the detected ones.
+pub fn ports_for(detected: &[InputPort], config: Option<&MonitorConfig>) -> Vec<Port> {
+    let settings = config.map_or(&[][..], |m| &m.ports[..]);
+    let setting = |code| settings.iter().find(|p| p.code == code);
+    let mut ports: Vec<Port> = detected
+        .iter()
+        .map(|d| Port {
+            code: d.code,
+            name: d.name.clone(),
+            label: setting(d.code).and_then(|s| s.label.clone()),
+            hidden: setting(d.code).is_some_and(|s| s.hidden),
+        })
+        .collect();
+    for s in settings {
+        if !ports.iter().any(|p| p.code == s.code) {
+            ports.push(Port {
+                code: s.code,
+                name: caps::port_name(s.code),
+                label: s.label.clone(),
+                hidden: s.hidden,
+            });
+        }
+    }
+    ports
+}
+
+/// A display with its ports and the active input.
 #[derive(Debug, Clone)]
 pub struct Monitor {
     pub display: Display,
-    pub ports: Vec<InputPort>,
+    pub ports: Vec<Port>,
     pub active: Result<u8, Error>,
 }
 
-/// Reads every display's ports and active input.
-pub fn list_monitors(backend: &dyn DdcBackend) -> Result<Vec<Monitor>, Error> {
+/// Reads every display's ports and active input, applying the config.
+pub fn list_monitors(backend: &dyn DdcBackend, config: &Config) -> Result<Vec<Monitor>, Error> {
     backend
         .list_displays()?
         .into_iter()
         .map(|display| {
-            let mut ports = caps::input_ports(&backend.capabilities(&display)?);
+            let mut detected = caps::input_ports(&backend.capabilities(&display)?);
             let active = backend.get_input(&display);
             if let Ok(code) = active
-                && !ports.iter().any(|p| p.code == code)
+                && !detected.iter().any(|p| p.code == code)
             {
-                ports.push(InputPort {
+                detected.push(InputPort {
                     code,
                     name: caps::port_name(code),
                 });
             }
+            let ports = ports_for(&detected, config.monitor(&display));
             Ok(Monitor {
                 display,
                 ports,
@@ -81,14 +131,21 @@ impl fmt::Display for Monitor {
             Some(serial) => writeln!(f, "{} ({serial})", self.display.name)?,
             None => writeln!(f, "{}", self.display.name)?,
         }
-        let width = self.ports.iter().map(|p| p.name.len()).max().unwrap_or(0) + 2;
-        for port in &self.ports {
+        // A hidden port still shows while it is active, so the list always marks
+        // the active input.
+        let visible: Vec<&Port> = self
+            .ports
+            .iter()
+            .filter(|p| !p.hidden || self.active.as_ref() == Ok(&p.code))
+            .collect();
+        let width = visible.iter().map(|p| p.title().len()).max().unwrap_or(0) + 2;
+        for port in visible {
             let mark = if self.active.as_ref() == Ok(&port.code) {
                 '*'
             } else {
                 ' '
             };
-            writeln!(f, "  {mark} {:<width$}{}", port.name, port.code)?;
+            writeln!(f, "  {mark} {:<width$}{}", port.title(), port.code)?;
         }
         if let Err(e) = &self.active {
             writeln!(f, "  active input unknown: {e}")?;
@@ -133,7 +190,11 @@ mod tests {
     }
 
     fn render(backend: &FakeBackend) -> String {
-        list_monitors(backend)
+        render_with(backend, &Config::default())
+    }
+
+    fn render_with(backend: &FakeBackend, config: &Config) -> String {
+        list_monitors(backend, config)
             .unwrap()
             .iter()
             .map(|m| m.to_string())
@@ -182,6 +243,64 @@ mod tests {
             displays: vec![],
             input: Ok(27),
         };
-        assert!(list_monitors(&backend).unwrap().is_empty());
+        assert!(
+            list_monitors(&backend, &Config::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn labels_are_shown_with_the_detected_name() {
+        let backend = FakeBackend {
+            displays: vec![dell()],
+            input: Ok(27),
+        };
+        assert_eq!(
+            render_with(&backend, &Config::defaults_for(&dell())),
+            "DELL U3223QE (9CY9834)\n  * MacBook (USB-C)  27\n    DP 1             15\n    Linux (HDMI 1)   17\n"
+        );
+    }
+
+    #[test]
+    fn hidden_ports_are_left_out() {
+        let backend = FakeBackend {
+            displays: vec![dell()],
+            input: Ok(27),
+        };
+        let config = Config::parse(
+            "[[monitor]]\nmodel = \"DELL U3223QE\"\n[[monitor.port]]\ncode = 15\nhidden = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            render_with(&backend, &config),
+            "DELL U3223QE (9CY9834)\n  * USB-C   27\n    HDMI 1  17\n"
+        );
+    }
+
+    #[test]
+    fn configured_port_missing_from_capabilities_is_listed() {
+        let backend = FakeBackend {
+            displays: vec![dell()],
+            input: Ok(27),
+        };
+        let config = Config::parse(
+            "[[monitor]]\nmodel = \"DELL U3223QE\"\n[[monitor.port]]\ncode = 16\nlabel = \"Spare\"\n",
+        )
+        .unwrap();
+        assert!(render_with(&backend, &config).ends_with("    Spare (DP 2)  16\n"));
+    }
+
+    #[test]
+    fn a_hidden_port_is_still_shown_while_it_is_active() {
+        let backend = FakeBackend {
+            displays: vec![dell()],
+            input: Ok(15),
+        };
+        let config = Config::parse(
+            "[[monitor]]\nmodel = \"DELL U3223QE\"\n[[monitor.port]]\ncode = 15\nhidden = true\n",
+        )
+        .unwrap();
+        assert!(render_with(&backend, &config).contains("  * DP 1    15\n"));
     }
 }
