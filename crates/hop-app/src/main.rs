@@ -18,11 +18,13 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{
     AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 const TRAY_ID: &str = "hop";
 const QUIT_ID: &str = "quit";
 const SETTINGS_ID: &str = "settings";
+const OPEN_AT_LOGIN_ID: &str = "open-at-login";
 const PORT_PREFIX: &str = "port:";
 /// Fallback refresh, for input changes made outside Hop.
 const REFRESH_EVERY: Duration = Duration::from_secs(15);
@@ -193,6 +195,10 @@ enum MenuState {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .on_window_event(|window, event| {
             // A recording may still be running when Settings closes; make
             // sure the hotkeys come back.
@@ -212,6 +218,7 @@ fn main() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            open_at_login_once(app.handle());
 
             let (jobs, rx) = mpsc::channel();
             TrayIconBuilder::with_id(TRAY_ID)
@@ -268,6 +275,8 @@ fn on_menu_click(app: &AppHandle, id: &str, jobs: &Sender<Job>) {
         app.exit(0);
     } else if id == SETTINGS_ID {
         open_settings(app);
+    } else if id == OPEN_AT_LOGIN_ID {
+        toggle_open_at_login(app);
     } else if let Some(code) = id.strip_prefix(PORT_PREFIX).and_then(|c| c.parse().ok()) {
         let _ = jobs.send(Job::Switch(code));
     }
@@ -522,6 +531,42 @@ fn register_hotkeys(app: &AppHandle, bindings: Vec<Binding>, jobs: Sender<Job>) 
     });
 }
 
+/// Turns on Open at Login the first time the installed app runs. A build run
+/// from the source tree is left alone, because the login item records the
+/// app's path. A marker file keeps a later "off" choice.
+fn open_at_login_once(app: &AppHandle) {
+    let installed = std::env::current_exe().is_ok_and(|exe| exe.starts_with("/Applications"));
+    let marker = config::default_path().with_file_name("login-item-set");
+    if !installed || marker.exists() {
+        return;
+    }
+    if let Err(e) = app.autolaunch().enable() {
+        eprintln!("hop: could not turn on Open at Login: {e}");
+        return;
+    }
+    let written = marker
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&marker, ""));
+    if let Err(e) = written {
+        eprintln!("hop: could not record the login item choice: {e}");
+    }
+}
+
+fn toggle_open_at_login(app: &AppHandle) {
+    let launcher = app.autolaunch();
+    let result = if launcher.is_enabled().unwrap_or(false) {
+        launcher.disable()
+    } else {
+        launcher.enable()
+    };
+    if let Err(e) = result {
+        eprintln!("hop: could not change Open at Login: {e}");
+    }
+    // The check item flips itself on click; later menu rebuilds read the
+    // real state from the login item.
+}
+
 /// Shows the Settings window, creating it on first use.
 fn open_settings(app: &AppHandle) {
     let window = match app.get_webview_window(SETTINGS_ID) {
@@ -599,6 +644,11 @@ fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
     }
     menu.separator()
         .item(&MenuItemBuilder::with_id(SETTINGS_ID, "Settings…").build(app)?)
+        .item(
+            &CheckMenuItemBuilder::with_id(OPEN_AT_LOGIN_ID, "Open at Login")
+                .checked(app.autolaunch().is_enabled().unwrap_or(false))
+                .build(app)?,
+        )
         .item(&MenuItemBuilder::with_id(QUIT_ID, "Quit Hop").build(app)?)
         .build()
 }
