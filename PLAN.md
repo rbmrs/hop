@@ -77,9 +77,20 @@ id = "DELL U3223QE"          # match by model/serial, not volatile UUID
   hotkey = "Ctrl+Alt+Cmd+Minus"
 ```
 
-Verify the real codes on the U3223QE during discovery. Common Dell values:
-DP1 = 15, HDMI1 = 17, USB-C = 27. Note: `m1ddc get input` returned `110`
-during investigation, so don't trust readback blindly; verify.
+Codes verified on the U3223QE (#2): USB-C = 27, DP1 = 15, HDMI1 = 17. The
+capabilities string lists `60(1B 0F 11)`. DDC rules found in that spike
+(reference code: `spikes/ddc-probe/probe.c`):
+
+- Use only the low byte of the VCP 0x60 value. The Dell sets the high byte
+  to 0x1B on every input (reads 0x1B1B on USB-C, 0x1B11 on HDMI).
+- Validate each reply: source byte 0x6E, length, opcode, VCP code, checksum.
+  Wait 50 ms between write and read. Retry on a bad reply.
+- m1ddc's `110` readback is 0x6E, the reply's source byte. m1ddc reads at the
+  wrong offset about 1 time in 3. With validation, 30 of 30 reads passed.
+- For about 3 s after a switch, the monitor sends null replies (`6e 80 be`).
+  Retry with a short backoff, or skip the readback right after a switch.
+- Reading capabilities takes about 1 s. Cache the result per monitor.
+- After a switch to HDMI, the Mac still sees the display and can switch back.
 
 ## Known risks
 
