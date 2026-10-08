@@ -28,8 +28,8 @@ const CONFIRM_FOR: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let backend = backend();
-    let config = match load_config(&backend) {
+    let backend = hop_core::default_backend();
+    let config = match config::load_for(&backend) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("hop: {e}");
@@ -40,13 +40,6 @@ fn main() -> ExitCode {
         Command::List => list(&backend, &config),
         Command::Switch { port } => switch_to(&backend, &config, &port),
     }
-}
-
-/// Loads the config; on first run, writes defaults for the detected monitor.
-fn load_config(backend: &dyn DdcBackend) -> Result<Config, config::ConfigError> {
-    // If detection fails here, the command itself reports it.
-    let displays = backend.list_displays().unwrap_or_default();
-    config::load_or_create(&config::default_path(), &displays)
 }
 
 fn switch_to(backend: &dyn DdcBackend, config: &Config, port: &str) -> ExitCode {
@@ -92,9 +85,4 @@ fn list(backend: &dyn DdcBackend, config: &Config) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn backend() -> hop_core::macos::MacBackend {
-    hop_core::macos::MacBackend::new()
 }

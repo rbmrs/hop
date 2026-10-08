@@ -55,6 +55,11 @@ pub struct Port {
 }
 
 impl Port {
+    /// "Linux" with a label, else "HDMI 1".
+    pub fn label_or_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
+
     /// "Linux (HDMI 1)" with a label, else "HDMI 1".
     pub fn title(&self) -> String {
         match &self.label {
@@ -125,26 +130,30 @@ pub fn list_monitors(backend: &dyn DdcBackend, config: &Config) -> Result<Vec<Mo
         .collect()
 }
 
+impl Monitor {
+    pub fn is_active(&self, code: u8) -> bool {
+        self.active.as_ref() == Ok(&code)
+    }
+
+    /// Ports that are not hidden. A hidden port still shows while it is
+    /// active, so the active input is always visible.
+    pub fn visible_ports(&self) -> impl Iterator<Item = &Port> {
+        self.ports
+            .iter()
+            .filter(|p| !p.hidden || self.is_active(p.code))
+    }
+}
+
 impl fmt::Display for Monitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.display.serial {
             Some(serial) => writeln!(f, "{} ({serial})", self.display.name)?,
             None => writeln!(f, "{}", self.display.name)?,
         }
-        // A hidden port still shows while it is active, so the list always marks
-        // the active input.
-        let visible: Vec<&Port> = self
-            .ports
-            .iter()
-            .filter(|p| !p.hidden || self.active.as_ref() == Ok(&p.code))
-            .collect();
+        let visible: Vec<&Port> = self.visible_ports().collect();
         let width = visible.iter().map(|p| p.title().len()).max().unwrap_or(0) + 2;
         for port in visible {
-            let mark = if self.active.as_ref() == Ok(&port.code) {
-                '*'
-            } else {
-                ' '
-            };
+            let mark = if self.is_active(port.code) { '*' } else { ' ' };
             writeln!(f, "  {mark} {:<width$}{}", port.title(), port.code)?;
         }
         if let Err(e) = &self.active {

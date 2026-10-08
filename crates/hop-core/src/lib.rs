@@ -3,6 +3,7 @@
 pub mod caps;
 pub mod config;
 pub mod ddc;
+pub mod menu;
 pub mod monitor;
 pub mod switch;
 
@@ -10,3 +11,9 @@ pub mod switch;
 pub mod macos;
 
 pub use monitor::{DdcBackend, Display, Error, Monitor, list_monitors};
+
+/// The DDC backend for this OS.
+#[cfg(target_os = "macos")]
+pub fn default_backend() -> macos::MacBackend {
+    macos::MacBackend::new()
+}

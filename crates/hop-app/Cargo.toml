@@ -1,0 +1,15 @@
+[package]
+name = "hop-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hop-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+hop-core = { path = "../hop-core" }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }

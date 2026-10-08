@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::monitor::Display;
+use crate::monitor::{DdcBackend, Display};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -157,6 +157,14 @@ pub fn load_or_create(path: &Path, displays: &[Display]) -> Result<Config, Confi
         }
         Err(e) => Err(ConfigError::new(path, ConfigErrorKind::Io(e))),
     }
+}
+
+/// Loads the config at the default path. On first run, writes defaults for
+/// the backend's first display. If detection fails, the caller's own DDC
+/// call reports it.
+pub fn load_for(backend: &dyn DdcBackend) -> Result<Config, ConfigError> {
+    let displays = backend.list_displays().unwrap_or_default();
+    load_or_create(&default_path(), &displays)
 }
 
 #[cfg(test)]
